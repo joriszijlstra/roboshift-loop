@@ -3,7 +3,7 @@
 // "Network-first met cache-fallback" zodat je nooit een verouderde versie
 // vastzit als er wél internet is.
 
-const CACHE_NAME = "mep-lijst-v5";
+const CACHE_NAME = "mep-lijst-v6";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -27,7 +27,7 @@ const APP_SHELL = [
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)).catch(() => {})
+    caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL.map((u) => new Request(u, { cache: "reload" })))).catch(() => {})
   );
   self.skipWaiting();
 });
@@ -48,7 +48,9 @@ self.addEventListener("fetch", (event) => {
   if (req.method !== "GET" || new URL(req.url).origin !== self.location.origin) return;
 
   event.respondWith(
-    fetch(req)
+    // "no-cache": altijd bij de server checken of er een nieuwe versie is,
+    // zodat een update meteen aankomt i.p.v. pas na de browsercache.
+    fetch(req, { cache: "no-cache" })
       .then((res) => {
         const copy = res.clone();
         caches.open(CACHE_NAME).then((cache) => cache.put(req, copy)).catch(() => {});
