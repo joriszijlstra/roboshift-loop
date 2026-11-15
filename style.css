@@ -1747,3 +1747,9 @@ body.rs-no-opm.rs-no-pe .remarks-card{display:none!important;}
 .zaak-field input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--todo-bg);}
 
 .name-chip,.chip,.chip button{border-radius:8px!important;}
+
+/* Eenmalig inloggen (Supabase-account, zelfde als Fill) */
+.login-gate-overlay { z-index: 300; } /* boven deviceGate en namePrompt */
+.login-gate-form { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
+.login-gate-form input { width: 100%; box-sizing: border-box; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; background: var(--row-alt); color: var(--ink); font: inherit; }
+.login-gate-hint { font-size: 13px; margin-top: 10px; }
