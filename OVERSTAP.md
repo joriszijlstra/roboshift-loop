@@ -11,7 +11,7 @@ Netlify en Firebase blijven draaien tot de laatste stap. Tot dan kun je altijd t
 ## Overstap (als de keuken dicht is)
 
 4. Branch `supabase` mergen naar `main` (pull request). GitHub Pages zet de nieuwe versie binnen ~1 minuut live. Netlify draait nog gewoon op Firebase.
-5. Open `https://loop.roboshift.nl/migreer.html` (of `https://joriszijlstra.github.io/roboshift-loop/migreer.html`):
+5. Open `https://loop.roboshift.nl/migreer.html` (of `https://loop.roboshift.nl/migreer.html`):
    - klik **1. Tel** om te zien wat er in Firebase staat;
    - klik **2. Kopieer en controleer**. Alle regels moeten een groen ✓ krijgen.
 6. Open Loop op het nieuwe adres. Rechtsboven moet **🟢 Live** staan, en de lijst van vandaag moet er hetzelfde uitzien als op Netlify.
