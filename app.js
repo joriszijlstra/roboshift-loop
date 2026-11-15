@@ -915,6 +915,370 @@ async function makeCloudBackend(config) {
 }
 
 // ----------------------------------------------------------------------------
+// SUPABASE backend (tabel loop_docs + Realtime)
+// ----------------------------------------------------------------------------
+// Spiegelt het Firestore-model 1-op-1: elke rij is één "document"
+// (collection, id, data). Daardoor blijft alle app-logica hierboven gelijk en
+// is de migratie vanuit Firebase een rechte kopie (zie migreer.html).
+// - Alles behalve dayStates wordt bij start in één keer geladen en daarna via
+//   Realtime bijgehouden (net als onSnapshot).
+// - Velden wijzigen ("items.x.checked") loopt via de SQL-functie loop_patch,
+//   die alleen die velden atomair aanpast. Twee toestellen die tegelijk
+//   verschillende items afvinken overschrijven elkaar dus niet.
+// - Schrijfacties werken de lokale cache meteen bij (zoals Firestore doet),
+//   zodat de lijst direct reageert; Realtime bevestigt daarna.
+async function makeSupabaseBackend(config) {
+  if (!window.supabase || !window.supabase.createClient) throw new Error("supabase.js niet geladen");
+  const sb = window.supabase.createClient(config.url, config.key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+  const T = "loop_docs";
+  const cache = new Map(); // "col/id" -> data
+  const bus = new EventTarget();
+  const K = (c, i) => `${c}/${i}`;
+  const clone = (v) => (v == null ? v : JSON.parse(JSON.stringify(v)));
+  function emit(col, id) {
+    bus.dispatchEvent(new CustomEvent(`doc:${K(col, id)}`));
+    bus.dispatchEvent(new CustomEvent(`col:${col}`));
+  }
+  function listen(evt, fn) {
+    bus.addEventListener(evt, fn);
+    fn();
+    return () => bus.removeEventListener(evt, fn);
+  }
+  function check(res, wat) {
+    if (res.error) { console.error(`Supabase-fout (${wat}):`, res.error); throw res.error; }
+    return res.data;
+  }
+  function deepSet(obj, path, val) {
+    const parts = path.split(".");
+    let o = obj;
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (!o[parts[i]] || typeof o[parts[i]] !== "object") o[parts[i]] = {};
+      o = o[parts[i]];
+    }
+    o[parts[parts.length - 1]] = val;
+  }
+
+  async function loadAll() {
+    const rows = check(await sb.from(T).select("collection,id,data").neq("collection", "dayStates"), "laden");
+    const seen = new Set();
+    for (const r of rows) { const key = K(r.collection, r.id); seen.add(key); cache.set(key, r.data); emit(r.collection, r.id); }
+    for (const key of [...cache.keys()]) {
+      if (key.startsWith("dayStates/")) continue;
+      if (!seen.has(key)) { cache.delete(key); const [c, ...rest] = key.split("/"); emit(c, rest.join("/")); }
+    }
+  }
+  async function fetchDoc(col, id) {
+    const row = check(await sb.from(T).select("data").eq("collection", col).eq("id", id).maybeSingle(), `lezen ${col}/${id}`);
+    if (row) cache.set(K(col, id), row.data); else cache.delete(K(col, id));
+    return row ? row.data : null;
+  }
+  async function getDocData(col, id) {
+    return cache.has(K(col, id)) ? clone(cache.get(K(col, id))) : fetchDoc(col, id);
+  }
+  async function setDocData(col, id, data) {
+    cache.set(K(col, id), clone(data)); emit(col, id);
+    check(await sb.from(T).upsert({ collection: col, id, data }), `opslaan ${col}/${id}`);
+  }
+  async function mergeDocData(col, id, patch) {
+    const cur = (await getDocData(col, id)) || {};
+    await setDocData(col, id, { ...cur, ...patch });
+  }
+  // Zoals Firestore updateDoc: gooit een fout als het document niet bestaat.
+  async function patchDoc(col, id, set) {
+    const key = K(col, id);
+    if (cache.has(key)) {
+      const local = clone(cache.get(key));
+      for (const [p, v] of Object.entries(set)) deepSet(local, p, v);
+      cache.set(key, local); emit(col, id);
+    }
+    const ok = check(await sb.rpc("loop_patch", { p_collection: col, p_id: id, p_set: set }), `wijzigen ${col}/${id}`);
+    if (!ok) { cache.delete(key); throw new Error(`document ${key} bestaat niet`); }
+  }
+  async function deleteDocData(col, id) {
+    cache.delete(K(col, id)); emit(col, id);
+    check(await sb.from(T).delete().eq("collection", col).eq("id", id), `verwijderen ${col}/${id}`);
+  }
+  function colDocs(col) {
+    const out = [];
+    for (const [key, data] of cache) if (key.startsWith(col + "/")) out.push({ id: key.slice(col.length + 1), ...clone(data) });
+    return out;
+  }
+  const docOr = (col, id, fallback) => (cache.has(K(col, id)) ? clone(cache.get(K(col, id))) : fallback);
+
+  await loadAll(); // gooit door bij fout -> caller valt terug op local
+
+  // Realtime: wijzigingen van andere toestellen binnenhalen. Na een
+  // herverbinding alles opnieuw laden, zodat gemiste wijzigingen niet wegvallen.
+  let subscribedOnce = false;
+  await new Promise((resolve) => {
+    const t = setTimeout(() => { console.warn("Realtime nog niet verbonden; lijst werkt, live updates volgen zodra er verbinding is."); resolve(); }, 8000);
+    sb.channel("loop_docs_live")
+      .on("postgres_changes", { event: "*", schema: "public", table: T }, (p) => {
+        if (p.eventType === "DELETE") {
+          const o = p.old || {};
+          if (o.collection == null) return;
+          cache.delete(K(o.collection, o.id)); emit(o.collection, o.id);
+        } else {
+          const n = p.new;
+          const key = K(n.collection, n.id);
+          // dayStates alleen bijhouden als die dag in beeld is (al in cache).
+          if (n.collection === "dayStates" && !cache.has(key) && !bus._watchDays?.has(n.id)) return;
+          cache.set(key, n.data); emit(n.collection, n.id);
+        }
+      })
+      .subscribe((status) => {
+        if (status === "SUBSCRIBED") {
+          clearTimeout(t);
+          if (subscribedOnce) {
+            loadAll().catch(() => {});
+            for (const id of bus._watchDays || []) fetchDoc("dayStates", id).then(() => emit("dayStates", id)).catch(() => {});
+          }
+          subscribedOnce = true;
+          resolve();
+        }
+      });
+  });
+  bus._watchDays = new Set();
+
+  const ACC0 = { codes: {}, admins: [], activated: false };
+  const DEV0 = { approved: {}, pendingCode: null, activated: false };
+
+  return {
+    mode: "cloud",
+    ready: Promise.resolve(),
+
+    onMenu(cb) { return listen("col:menuItems", () => cb(colDocs("menuItems"))); },
+    onCategories(cb) { return listen("col:categories", () => cb(colDocs("categories"))); },
+    onPlanning(cb) { return listen("col:planning", () => cb(colDocs("planning"))); },
+    onTeam(cb) { return listen("doc:team/members", () => cb((docOr("team", "members", {}).names) || [])); },
+    onAccessCodes(cb) {
+      return listen("doc:team/accessCodes", () => {
+        const d = docOr("team", "accessCodes", {});
+        cb({ codes: d.codes || {}, admins: d.admins || [], activated: !!d.activated });
+      });
+    },
+    onDevices(cb) {
+      return listen("doc:team/devices", () => {
+        const d = docOr("team", "devices", {});
+        cb({ approved: d.approved || {}, pendingCode: d.pendingCode || null, activated: !!d.activated });
+      });
+    },
+    onZaakSettings(cb) { return listen("doc:settings/zaak", () => cb(docOr("settings", "zaak", {}))); },
+    onTelegramSettings(cb) {
+      return listen("doc:settings/telegram", () => {
+        const d = docOr("settings", "telegram", {});
+        cb({ enabled: !!d.enabled, botToken: d.botToken || "", chatId: d.chatId || "" });
+      });
+    },
+    onWhatsappSettings(cb) {
+      return listen("doc:settings/whatsapp", () => {
+        const d = docOr("settings", "whatsapp", {});
+        cb({ enabled: !!d.enabled, phone: d.phone || "", apikey: d.apikey || "" });
+      });
+    },
+    onDayState(k, cb) {
+      bus._watchDays.add(k);
+      const evt = `doc:${K("dayStates", k)}`;
+      const fn = () => { if (cache.has(K("dayStates", k))) cb({ ...defaultDayDoc(k), ...clone(cache.get(K("dayStates", k))) }); };
+      bus.addEventListener(evt, fn);
+      (async () => {
+        let d = await fetchDoc("dayStates", k).catch((e) => { console.error(`onDayState-fout (${k}):`, e); return undefined; });
+        if (d === null) {
+          // Nog geen document: aanmaken zonder een eventueel net door een
+          // ander toestel aangemaakt document te overschrijven.
+          await sb.from(T).upsert({ collection: "dayStates", id: k, data: defaultDayDoc(k) }, { ignoreDuplicates: true });
+          d = await fetchDoc("dayStates", k).catch(() => null);
+        }
+        fn();
+      })();
+      return () => { bus.removeEventListener(evt, fn); bus._watchDays.delete(k); };
+    },
+
+    async setItemField(k, itemId, patch) {
+      const upd = {};
+      for (const [key, v] of Object.entries(patch)) upd[`items.${itemId}.${key}`] = v;
+      await patchDoc("dayStates", k, upd).catch(async () => {
+        const fresh = defaultDayDoc(k);
+        fresh.items[itemId] = { hoeveelheid: "", checked: false, paraaf: "", checkedAt: null, note: "", steps: {}, ...patch };
+        await setDocData("dayStates", k, fresh);
+      });
+    },
+    async setStep(k, itemId, stepIndex, patch) {
+      const upd = {};
+      for (const [key, v] of Object.entries(patch)) upd[`items.${itemId}.steps.${stepIndex}.${key}`] = v;
+      await patchDoc("dayStates", k, upd).catch(async () => {
+        const fresh = defaultDayDoc(k);
+        fresh.items[itemId] = { hoeveelheid: "", checked: false, paraaf: "", checkedAt: null, note: "", steps: { [stepIndex]: patch } };
+        await setDocData("dayStates", k, fresh);
+      });
+    },
+    async setNote(k, itemId, note) {
+      await patchDoc("dayStates", k, { [`items.${itemId}.note`]: note }).catch(async () => {
+        const fresh = defaultDayDoc(k);
+        fresh.items[itemId] = { hoeveelheid: "", checked: false, paraaf: "", checkedAt: null, note, steps: {} };
+        await setDocData("dayStates", k, fresh);
+      });
+    },
+    async clearItem(k, itemId) {
+      await patchDoc("dayStates", k, {
+        [`items.${itemId}`]: { hoeveelheid: "", checked: false, paraaf: "", checkedAt: null, note: "", steps: {} },
+      }).catch(async () => { await setDocData("dayStates", k, defaultDayDoc(k)); });
+    },
+    async setHeader(k, patch) {
+      await patchDoc("dayStates", k, patch).catch(async () => {
+        await setDocData("dayStates", k, { ...defaultDayDoc(k), ...patch });
+      });
+    },
+    async approveDay(k, { door }) {
+      const patch = { approved: true, approvedBy: door, approvedAt: Date.now() };
+      await patchDoc("dayStates", k, patch).catch(async () => {
+        await setDocData("dayStates", k, { ...defaultDayDoc(k), ...patch });
+      });
+    },
+    async getDayStatesRange(startKey, endKey) {
+      const rows = check(await sb.from(T).select("id,data").eq("collection", "dayStates")
+        .gte("id", startKey).lte("id", endKey).order("id"), "dagen ophalen");
+      return rows.map((r) => ({ dateKey: r.id, data: r.data }));
+    },
+
+    async addTeamMember(name) {
+      const names = ((await getDocData("team", "members")) || {}).names || [];
+      if (!names.includes(name)) await setDocData("team", "members", { names: [...names, name] });
+    },
+    async removeTeamMember(name) {
+      const names = ((await getDocData("team", "members")) || {}).names || [];
+      await setDocData("team", "members", { names: names.filter((n) => n !== name) });
+      const d = (await getDocData("team", "accessCodes")) || {};
+      const codes = d.codes || {};
+      let admins = d.admins || [];
+      let changed = false;
+      if (codes[name] !== undefined) { delete codes[name]; changed = true; }
+      if (admins.includes(name)) { admins = admins.filter((n) => n !== name); changed = true; }
+      if (changed) await setDocData("team", "accessCodes", { codes, admins, activated: !!d.activated });
+    },
+    async setAccessCode(name, code) {
+      const d = (await getDocData("team", "accessCodes")) || {};
+      const codes = d.codes || {};
+      const admins = d.admins || [];
+      let activated = !!d.activated;
+      const trimmed = (code || "").trim();
+      if (trimmed) { codes[name] = trimmed; activated = true; } else { delete codes[name]; }
+      await setDocData("team", "accessCodes", { codes, admins, activated });
+    },
+    async setAdminFlag(name, isAdmin) {
+      const d = (await getDocData("team", "accessCodes")) || {};
+      let admins = d.admins || [];
+      const has = admins.includes(name);
+      if (isAdmin && !has) admins = [...admins, name];
+      if (!isAdmin && has) admins = admins.filter((n) => n !== name);
+      await setDocData("team", "accessCodes", { codes: d.codes || {}, admins, activated: !!d.activated });
+    },
+
+    async generateDeviceCode() {
+      const d = (await getDocData("team", "devices")) || {};
+      const code = genDeviceCode();
+      await setDocData("team", "devices", { approved: d.approved || {}, pendingCode: { code, createdAt: Date.now() }, activated: true });
+      return code;
+    },
+    async clearDeviceCode() {
+      const d = (await getDocData("team", "devices")) || {};
+      await setDocData("team", "devices", { approved: d.approved || {}, pendingCode: null, activated: !!d.activated });
+    },
+    async approveDevice(id, label) {
+      const d = (await getDocData("team", "devices")) || {};
+      const approved = d.approved || {};
+      approved[id] = { label: (label || "Toestel").trim(), approvedAt: Date.now() };
+      await setDocData("team", "devices", { approved, pendingCode: d.pendingCode || null, activated: !!d.activated });
+    },
+    async revokeDevice(id) {
+      const d = (await getDocData("team", "devices")) || {};
+      const approved = d.approved || {};
+      delete approved[id];
+      await setDocData("team", "devices", { approved, pendingCode: d.pendingCode || null, activated: !!d.activated });
+    },
+
+    async addItem({ categorie, naam }) {
+      const id = `${categorie}__${slugify(naam)}-${Date.now().toString(36)}`;
+      await setDocData("menuItems", id, { naam, categorie, order: Date.now(), actief: true, stappen: [] });
+    },
+    async removeItem(itemId) { await deleteDocData("menuItems", itemId); },
+    async updateItem(itemId, patch) { await patchDoc("menuItems", itemId, patch); },
+    async addCategory(cat) { await setDocData("categories", cat.id, cat); },
+    async updateCategory(catId, patch) { await patchDoc("categories", catId, patch); },
+
+    async addPlanning({ itemId, targetDateKey, note, createdBy }) {
+      const id = `plan_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+      await setDocData("planning", id, { itemId, targetDateKey, note: (note || "").trim(), createdBy: createdBy || "", createdAt: Date.now() });
+      return id;
+    },
+    async removePlanning(id) { await deleteDocData("planning", id); },
+    async setZaakSettings(patch) { await mergeDocData("settings", "zaak", patch); },
+    async setTelegramSettings(patch) {
+      const cur = (await getDocData("settings", "telegram")) || { enabled: false, botToken: "", chatId: "" };
+      await setDocData("settings", "telegram", { ...cur, ...patch });
+    },
+    async setWhatsappSettings(patch) {
+      const cur = (await getDocData("settings", "whatsapp")) || { enabled: false, phone: "", apikey: "" };
+      await setDocData("settings", "whatsapp", { ...cur, ...patch });
+    },
+
+    async seedIfEmpty(defaultCategories, defaultItems, defaultTeam) {
+      if (colDocs("categories").length === 0 && colDocs("menuItems").length === 0) {
+        const rows = [
+          ...defaultCategories.map((c, i) => ({ collection: "categories", id: c.id, data: { ...c, order: i } })),
+          ...defaultItems.map((it) => ({ collection: "menuItems", id: it.id, data: { naam: it.naam, categorie: it.categorie, order: it.order, actief: true, stappen: [] } })),
+        ];
+        check(await sb.from(T).upsert(rows, { ignoreDuplicates: true }), "startlijst");
+        await loadAll();
+      }
+      if (defaultTeam && defaultTeam.length) {
+        const t = await getDocData("team", "members");
+        if (!t || !(t.names || []).length) await setDocData("team", "members", { names: defaultTeam });
+      }
+    },
+
+    // Het oude één-lijst-model komt alleen nog in Firebase voor; migreer.html
+    // kopieert dat mee. Hier is niets meer te doen.
+    async migrateLegacyIfNeeded() {},
+
+    async rolloverIfNeeded(menuItems) {
+      const todayK = dateKey(new Date());
+      const yesterdayK = dateKey(addDays(new Date(), -1));
+      const byId = new Map((menuItems || []).map((m) => [m.id, m]));
+      try {
+        const [todayData, yestData] = await Promise.all([fetchDoc("dayStates", todayK), fetchDoc("dayStates", yesterdayK)]);
+        const newDoc = todayData ? { ...defaultDayDoc(todayK), ...todayData } : defaultDayDoc(todayK);
+        if (newDoc.rolloverAppliedFrom === yesterdayK) return;
+        if (yestData) {
+          let personeelsGisteren = newDoc.personeelsetenGisteren || "";
+          const items = { ...(newDoc.items || {}) };
+          for (const [id, it] of Object.entries(yestData.items || {})) {
+            const menuItem = byId.get(id);
+            const existing = items[id];
+            const alreadyRelevant = existing && (itemIsOpen(menuItem, existing) || itemIsDone(menuItem, existing));
+            if (itemIsOpen(menuItem, it) && !alreadyRelevant) {
+              items[id] = { ...it, carriedOver: true, carryStreak: (it.carryStreak || 0) + 1, staleAlertSentAt: null };
+            }
+            if (id.endsWith("personeels-eten") && it.hoeveelheid) personeelsGisteren = it.hoeveelheid;
+          }
+          newDoc.items = items;
+          newDoc.personeelsetenGisteren = personeelsGisteren;
+        }
+        // Alleen de doorgeschoven velden zetten (atomair), zodat wat een ander
+        // toestel intussen al voor vandaag invulde blijft staan.
+        const upd = { rolloverAppliedFrom: yesterdayK, workDateKey: todayK, personeelsetenGisteren: newDoc.personeelsetenGisteren || "" };
+        for (const [id, it] of Object.entries(newDoc.items || {})) if (it && it.carriedOver && !(todayData && todayData.items && todayData.items[id] && todayData.items[id].carriedOver)) upd[`items.${id}`] = it;
+        await patchDoc("dayStates", todayK, upd).catch(async () => { await setDocData("dayStates", todayK, { ...newDoc, ...{ rolloverAppliedFrom: yesterdayK, workDateKey: todayK } }); });
+      } catch (e) {
+        console.warn("Rollover mislukt (waarschijnlijk race met ander toestel, geen probleem):", e);
+      }
+    },
+  };
+}
+
+// ----------------------------------------------------------------------------
 // App state & init
 // ----------------------------------------------------------------------------
 const state = {
@@ -988,9 +1352,28 @@ function showToast(msg, ms = 3200) {
 }
 
 async function initStore() {
+  const sbCfg = window.SUPABASE_CONFIG;
+  const pill = document.getElementById("syncPill");
+  if (sbCfg && sbCfg.url && sbCfg.key) {
+    try {
+      const backend = await makeSupabaseBackend(sbCfg);
+      Object.assign(Store, backend);
+      pill.textContent = "🟢 Live";
+      pill.title = "Live gesynchroniseerd tussen alle apparaten";
+      pill.className = "pill pill-live";
+      return;
+    } catch (e) {
+      console.warn("Kon niet verbinden met Supabase, val terug op lokale modus:", e);
+      showToast("Kon niet verbinden met de cloud-database (Supabase). Werkt nu lokaal op dit toestel.", 6000);
+      Object.assign(Store, makeLocalBackend());
+      pill.textContent = "📴 Demo-modus";
+      pill.title = "Alleen op dit toestel: geen verbinding met de cloud-database";
+      pill.className = "pill pill-local";
+      return;
+    }
+  }
   const cfg = window.FIREBASE_CONFIG;
   const looksReal = cfg && cfg.apiKey && !/PLAK-HIER|YOUR_API_KEY|AIzaSyXXX/i.test(cfg.apiKey);
-  const pill = document.getElementById("syncPill");
 
   if (looksReal) {
     try {
