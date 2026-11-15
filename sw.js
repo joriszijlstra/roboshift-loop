@@ -3,7 +3,7 @@
 // "Network-first met cache-fallback" zodat je nooit een verouderde versie
 // vastzit als er wél internet is.
 
-const CACHE_NAME = "mep-lijst-v4";
+const CACHE_NAME = "mep-lijst-v5";
 const APP_SHELL = [
   "./",
   "./index.html",

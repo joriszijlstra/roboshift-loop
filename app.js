@@ -915,6 +915,65 @@ async function makeCloudBackend(config) {
 }
 
 // ----------------------------------------------------------------------------
+// Eenmalig inloggen met het RoboShift-account (zelfde accounts als Fill).
+// Daarna blijft het toestel ingelogd; naam + code kiezen werkt zoals altijd.
+// De database laat alleen ingelogde teamleden (is_team()) bij de Loop-data.
+// ----------------------------------------------------------------------------
+const LOOP_RT_COOKIE = "loop_rt";
+const readLoopRt = () => (document.cookie.match(/(?:^|; )loop_rt=([^;]*)/) || [])[1];
+function writeLoopRt(t) {
+  document.cookie = `${LOOP_RT_COOKIE}=${t ? encodeURIComponent(t) : ""}; Max-Age=${t ? 31536000 : 0}; Path=/; SameSite=Lax${location.protocol === "https:" ? "; Secure" : ""}`;
+}
+async function supabaseLogin(config) {
+  if (!window.supabase || !window.supabase.createClient) throw new Error("supabase.js niet geladen");
+  const sb = window.supabase.createClient(config.url, config.key, {
+    auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false, storageKey: "loop-auth" },
+  });
+  // Verversingstoken ook in een cookie bewaren: iOS ruimt localStorage van
+  // beginscherm-apps soms op, dan blijft het toestel toch ingelogd.
+  sb.auth.onAuthStateChange((_evt, session) => { if (session && session.refresh_token) writeLoopRt(session.refresh_token); });
+
+  let { data: { session } } = await sb.auth.getSession();
+  if (!session && readLoopRt()) {
+    const r = await sb.auth.refreshSession({ refresh_token: decodeURIComponent(readLoopRt()) });
+    session = (r.data && r.data.session) || null;
+    if (!session) writeLoopRt(null);
+  }
+  const gate = document.getElementById("loginGate");
+  const err = document.getElementById("loginGateError");
+  const showErr = (m) => { err.textContent = m; err.classList.remove("hidden"); };
+  for (;;) {
+    if (session) {
+      const { data: ok, error } = await sb.rpc("is_team");
+      if (!error && ok) break;
+      if (error && !navigator.onLine) throw new Error("offline");
+      showErr(`Het account ${session.user.email} heeft geen toegang tot Loop. Vraag Joris om je toe te voegen (in Fill, bij Instellingen).`);
+      await sb.auth.signOut({ scope: "local" }); writeLoopRt(null); session = null;
+    }
+    gate.classList.remove("hidden");
+    try { document.getElementById("loginGateEmail").value = localStorage.getItem("loop-email") || ""; } catch (e) {}
+    session = await new Promise((resolve) => {
+      const form = document.getElementById("loginGateForm");
+      form.onsubmit = async (e) => {
+        e.preventDefault();
+        err.classList.add("hidden");
+        const btn = document.getElementById("loginGateBtn");
+        btn.disabled = true;
+        const email = document.getElementById("loginGateEmail").value.trim();
+        const { data, error } = await sb.auth.signInWithPassword({ email, password: document.getElementById("loginGatePassword").value });
+        btn.disabled = false;
+        if (error || !data.session) { showErr("Inloggen lukt niet: controleer je e-mail en wachtwoord."); return; }
+        try { localStorage.setItem("loop-email", email); } catch (e) {}
+        if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+        resolve(data.session);
+      };
+    });
+  }
+  gate.classList.add("hidden");
+  return sb;
+}
+
+// ----------------------------------------------------------------------------
 // SUPABASE backend (tabel loop_docs + Realtime)
 // ----------------------------------------------------------------------------
 // Spiegelt het Firestore-model 1-op-1: elke rij is één "document"
@@ -927,11 +986,13 @@ async function makeCloudBackend(config) {
 //   verschillende items afvinken overschrijven elkaar dus niet.
 // - Schrijfacties werken de lokale cache meteen bij (zoals Firestore doet),
 //   zodat de lijst direct reageert; Realtime bevestigt daarna.
-async function makeSupabaseBackend(config) {
-  if (!window.supabase || !window.supabase.createClient) throw new Error("supabase.js niet geladen");
-  const sb = window.supabase.createClient(config.url, config.key, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
+async function makeSupabaseBackend(sb) {
+  // Realtime met het login-token laten meekijken, anders ziet het (na de
+  // beveiliging op teamleden) geen wijzigingen van andere toestellen.
+  try {
+    const { data: { session } } = await sb.auth.getSession();
+    if (session) sb.realtime.setAuth(session.access_token);
+  } catch (e) { /* geen sessie: dan valt het terug op de publieke sleutel */ }
   const T = "loop_docs";
   const cache = new Map(); // "col/id" -> data
   const bus = new EventTarget();
@@ -1356,7 +1417,8 @@ async function initStore() {
   const pill = document.getElementById("syncPill");
   if (sbCfg && sbCfg.url && sbCfg.key) {
     try {
-      const backend = await makeSupabaseBackend(sbCfg);
+      const sb = await supabaseLogin(sbCfg);
+      const backend = await makeSupabaseBackend(sb);
       Object.assign(Store, backend);
       pill.textContent = "🟢 Live";
       pill.title = "Live gesynchroniseerd tussen alle apparaten";

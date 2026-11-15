@@ -44,6 +44,22 @@
 <div id="app">
 
   <!-- ===== Toestel nog niet goedgekeurd — gaat altijd vóór de naamkeuze ===== -->
+  <!-- ===== Eenmalig inloggen (zelfde account als Fill) ===== -->
+  <div id="loginGate" class="modal-overlay login-gate-overlay hidden">
+    <div class="modal name-modal">
+      <span class="rs-modal-icon" aria-hidden="true"></span>
+      <h2>Inloggen</h2>
+      <p class="muted">Log één keer in met je RoboShift-account (hetzelfde als bij Fill). Daarna kies je gewoon je naam en code.</p>
+      <form id="loginGateForm" class="login-gate-form">
+        <input id="loginGateEmail" type="email" placeholder="E-mailadres" autocomplete="username" required />
+        <input id="loginGatePassword" type="password" placeholder="Wachtwoord" autocomplete="current-password" required />
+        <button type="submit" class="btn btn-primary" id="loginGateBtn">Inloggen</button>
+      </form>
+      <p id="loginGateError" class="code-error hidden"></p>
+      <p class="muted login-gate-hint">Wachtwoord vergeten? Stel het opnieuw in via Fill.</p>
+    </div>
+  </div>
+
   <div id="deviceGate" class="modal-overlay device-gate-overlay hidden">
     <div class="modal name-modal">
       <span class="rs-modal-icon" aria-hidden="true"></span>
