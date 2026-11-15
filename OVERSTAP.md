@@ -6,7 +6,7 @@ Netlify en Firebase blijven draaien tot de laatste stap. Tot dan kun je altijd t
 
 1. **GitHub Pages aan**: repo → Settings → Pages → Source "Deploy from a branch", branch `main`, map `/ (root)` → Save.
 2. **Eigen adres (aanbevolen)**: bij de domeinbeheerder van roboshift.nl een CNAME-record `loop` → `joriszijlstra.github.io` toevoegen. Daarna in Settings → Pages bij "Custom domain" `loop.roboshift.nl` invullen en "Enforce HTTPS" aanvinken (kan tot een uur duren voordat het certificaat er is).
-3. **Supabase-tabel**: `supabase/001_loop_docs.sql` uitvoeren in het Supabase-project `bijvulscherm` (Claude doet dit na akkoord). Voegt alleen tabel `loop_docs` en twee functies toe; Fill en Pass merken er niets van.
+3. **Supabase-tabel**: `supabase/001_loop_docs.sql` uitvoeren in de SQL-editor van het Supabase-project `bijvulscherm` (Claude kan dit via Chrome doen na akkoord). Voegt alleen tabel `loop_docs` en een paar `loop_`-functies toe; Fill en Pass merken er niets van. Al getest op `roboshift-staging` (15 nov: 215 documenten gekopieerd, alles gelijk, live-updates werken).
 
 ## Overstap (als de keuken dicht is)
 
