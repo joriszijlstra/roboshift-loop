@@ -3,7 +3,7 @@
 // "Network-first met cache-fallback" zodat je nooit een verouderde versie
 // vastzit als er wél internet is.
 
-const CACHE_NAME = "mep-lijst-v8";
+const CACHE_NAME = "mep-lijst-v9";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -14,6 +14,8 @@ const APP_SHELL = [
   "./supabase-config.js",
   "./firebase-config.js",
   "./loop-fx.js",
+  "./handleiding.js",
+  "./handleiding-inhoud.js",
   "./manifest.json",
   "./icons/icon-192.png",
   "./icons/icon-512.png",
